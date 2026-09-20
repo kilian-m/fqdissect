@@ -1,0 +1,18 @@
+# conda env create -f environment.yml && conda activate fqdissect && pip install -e .
+#
+# STAR does the local alignment the read structure is read from. cutadapt is only
+# needed for `--trim`; it is run, never imported.
+name: fqdissect
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python>=3.10,<3.13
+  - numpy>=1.24
+  - pysam>=0.22
+  - matplotlib-base>=3.7
+  - star>=2.7.10
+  - samtools>=1.19
+  - cutadapt>=4.4
+  - pigz>=2.7
+  - pytest>=7.4

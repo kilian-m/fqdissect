@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fqdissect"
+version = "0.1.0"
+description = "Determine the structure of the reads in a FASTQ file (insert, UMIs, barcodes, adapter) de novo."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "GPL-3.0-only" }
+authors = [{ name = "Kilian Maidhof" }]
+keywords = ["fastq", "read structure", "adapter", "UMI", "ribo-seq", "ribosome profiling"]
+dependencies = [
+    "numpy>=1.24",
+    "pysam>=0.22",
+    "matplotlib>=3.7",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4"]
+
+[project.scripts]
+fqdissect = "fqdissect.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["fqdissect*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
