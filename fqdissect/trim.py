@@ -8,7 +8,10 @@ a UMI from either end of the read into the header (`-u +-N --rename`).
 
 What gets applied, in read order:
 
-    5'  [linker][barcode][UMI]...   cut at fixed offsets; UMI blocks -> read header
+    5'  [linker][UMI]...            cut at fixed offsets; UMI blocks -> read header
+        [barcode]                   found by anchored alignment (`-g ^BARCODE`, errors),
+                                    so an indel in it moves the cut with it; reads
+                                    without it are dropped
         [RT nt][== footprint ==]    kept
         [poly tail]                 trimmed (variable length)
         [nt][UMI][barcode]...       cut at fixed offsets from the scaffold; UMI -> header
@@ -18,6 +21,12 @@ What gets applied, in read order:
 The 3' blocks can only be located once the scaffold is gone, which is why a library
 with a 3' UMI needs more than one pass (cutadapt applies `-u` *before* `-a`). The
 passes are piped; nothing intermediate is written.
+
+A 5' barcode is a fixed sequence, so it is located rather than counted: anything
+fixed-length in front of it is cut in the same pass (cutadapt cuts `-u` before it
+looks for adapters), anything behind it in the next one, counted from where the
+barcode actually ended. Such a pass carries no 3' scaffold: cutadapt removes one
+adapter per pass.
 
 Reads that do not show the scaffold never reached the end of their molecule: their
 3' end is the read's end, not the footprint's, and a 3' UMI beyond it was never
@@ -37,6 +46,15 @@ from .utils import LOG, ToolError, require_tools
 ERROR_RATE = 0.12     # cutadapt's error model is a RATE: below ~9 nt of overlap the budget is 0
 POLY_PROBE = 10       # poly-tail-only libraries: a run this long IS the 3' boundary
 POLY_MIN = 6
+# Errors allowed in a 5' barcode: 40% of its length (4 nt: 1, 5-7 nt: 2, 8 nt: 3).
+# ERROR_RATE would allow none in a short barcode. On SRR24210493's 5-nt barcode (made
+# antisense, docs/METHOD.md section 9), 1 error dropped 6k reads with two substitutions
+# that a fixed cut handles; 2 errors keep them, for 140 more wrong cuts in 860k.
+BARCODE5_ERROR_RATE = 0.4
+
+
+def barcode_errors(seq: str) -> int:
+    return max(1, int(BARCODE5_ERROR_RATE * len(seq)))
 
 
 class UnsupportedStructure(ValueError):
@@ -47,8 +65,18 @@ class UnsupportedStructure(ValueError):
 def plan(call: dict) -> dict:
     """What has to happen to a read."""
     segs = structure.segments(call)
-    five = _merge([(s["len"], s["kind"] == "umi") for s in segs
-                   if s.get("side") == 5 and s["kind"] in ("umi", "barcode", "linker")])
+    # 5' steps in read order: fixed cuts (len, is_umi), merged, and anchored barcodes
+    five: list = []
+    run: list[tuple[int, bool]] = []
+    for sg in segs:
+        if sg.get("side") != 5 or sg["kind"] not in ("umi", "barcode", "linker"):
+            continue
+        if sg["kind"] == "barcode":
+            five += _merge(run) + [("g", sg["seq"])]
+            run = []
+        else:
+            run.append((sg["len"], sg["kind"] == "umi"))
+    five += _merge(run)
     tail = call.get("polyA_tail", "none")
     poly = tail[-1] if tail not in ("none", "", None) else None
     # outermost first; `three` is walked from the read's 3' end inwards, once the
@@ -63,7 +91,7 @@ def plan(call: dict) -> dict:
         # whatever follows, so cutting at it needs no knowledge of what follows.
         layers[-1]["scaffold"], poly_is_anchor = poly * POLY_PROBE, True
     return {"five": five, "layers": layers, "poly": poly, "poly_is_anchor": poly_is_anchor,
-            "umi_len": sum(n for n, u in five if u)
+            "umi_len": sum(n for n, u in five if u is True)
                        + sum(n for lay in layers for n, u in lay["three"] if u)}
 
 
@@ -78,6 +106,21 @@ def _merge(ops: list[tuple[int, bool]]) -> list[tuple[int, bool]]:
         else:
             out.append((n, umi))
     return out
+
+
+def _five_passes(five: list) -> list[dict]:
+    """Pack the 5' steps into passes: [one fixed cut]?[one anchored barcode]?, the cut
+    first -- the order cutadapt applies them in."""
+    passes: list[dict] = []
+    for step in five:
+        if step[0] == "g":
+            if passes and "g" not in passes[-1]:
+                passes[-1]["g"] = step[1]
+            else:
+                passes.append({"g": step[1]})
+        else:
+            passes.append({"five": step})
+    return passes
 
 
 def _three_passes(layers: list[dict]) -> list[dict]:
@@ -103,20 +146,25 @@ def _cutadapt_passes(p: dict, *, in_fq: str, out_fq: str, min_len: int, threads:
                      five: list, layers: list[dict]) -> list[dict]:
     """cutadapt passes: the 5' cuts, the 3' layers, and on the last one the poly tail
     and the minimum length."""
-    three = _three_passes(layers)
-    specs = [{"five": five[i] if i < len(five) else None,
-              **(three[i] if i < len(three) else {})}
-             for i in range(max(len(five), len(three), 1))]
+    # the two ends are independent; zip their passes, except that a pass with a 5'
+    # barcode cannot also take a 3' scaffold (one adapter per read and pass)
+    q5, q3 = _five_passes(five), _three_passes(layers)
+    specs: list[dict] = []
+    while q5 or q3 or not specs:
+        spec = q5.pop(0) if q5 else {}
+        if q3 and not ("g" in spec and "a" in q3[0]):
+            spec.update(q3.pop(0))
+        specs.append(spec)
     generic_poly = p["poly"] and not p["poly_is_anchor"] and p["poly"] != "A"
-    if generic_poly and "a" in specs[-1]:
-        specs.append({"five": None})     # the generic poly trimmer is itself an `-a`
+    if generic_poly and ("a" in specs[-1] or "g" in specs[-1]):
+        specs.append({})                 # the generic poly trimmer is itself an `-a`
     have_umi = False
 
     stages = []
     for i, spec in enumerate(specs):
         cmd = ["cutadapt", "-j", str(threads)]
         umi_fields = []
-        if spec["five"]:
+        if spec.get("five"):
             n, is_umi = spec["five"]
             cmd += ["-u", str(n)]
             if is_umi:
@@ -126,6 +174,11 @@ def _cutadapt_passes(p: dict, *, in_fq: str, out_fq: str, min_len: int, threads:
             cmd += ["-u", str(-n)]
             if is_umi:
                 umi_fields.append("{cut_suffix}")
+        if "g" in spec:
+            # reads without the barcode are dropped whatever --keep-untrimmed says: their
+            # 5' cut would land at an unknown place
+            cmd += ["-g", "^" + spec["g"], "-e", str(barcode_errors(spec["g"])),
+                    "--discard-untrimmed"]
         if "a" in spec:
             mo = POLY_MIN if p["poly_is_anchor"] else min_overlap
             cmd += ["-a", spec["a"], "-O", str(mo), "-e", str(ERROR_RATE)]

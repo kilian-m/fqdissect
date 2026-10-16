@@ -83,6 +83,12 @@ Useful options of `run`:
 * `-n/--sample`, `--scan` (0 = sample the whole file), `--bam` (reuse an existing local
   alignment), `--set NAME=VALUE` (override a calling threshold), `--no-annotate`,
   `--keep-tmp`.
+* `--gtf annotation.gtf` — also call whether the reads are **sense or antisense** to the
+  mRNA (or unstranded). Without it strandedness is not reported, and the reads are taken
+  to be sense: the reads show whether a library is stranded, but not which way round.
+  The strand is called first; in an **antisense** library the structure call looks for
+  the RT base and template-switch run at the read's 3' side, where the RNA's 5' end is.
+  See [docs/METHOD.md §9](docs/METHOD.md#9-strandedness---gtf).
 * `--star-genome-load LoadAndKeep` shares the index between many runs; free it afterwards
   with `STAR --genomeLoad Remove --genomeDir …`.
 
@@ -91,7 +97,7 @@ Useful options of `run`:
 | file | content |
 |---|---|
 | `<name>.structure.tsv` | the read structure as a table: one row per segment in read order, with length, fixed sequence and fate (see below) |
-| `<name>.structure.json` | the full call: ordered `segments`, every measured quantity, thresholds used, flags, and the `adapter_scaffold` string to hand to a trimmer |
+| `<name>.structure.json` | the full call: ordered `segments`, every measured quantity, thresholds used, flags, the `adapter_scaffold` string to hand to a trimmer, and `strandedness` (with `--gtf`) |
 | `<name>.profile.json` | the positional statistics the call was made from |
 | `<name>.structure.png` | `--plot`: the diagnostic figure |
 | `<name>.trimmed.fastq.gz`, `<name>.trimmed.sh`, logs | `--trim` |
@@ -139,6 +145,9 @@ adapter (a 3′ UMI, a UMI behind the adapter): cutadapt cuts fixed lengths *bef
 looks for the adapter, so the 3′ cut has to wait for the pass after. The passes are
 piped; nothing intermediate is written.
 
+* A 5' barcode is located by anchored alignment (`-g ^BARCODE`, 40 % of its length in
+  errors), not cut at a fixed length, so an indel in it does not shift the footprint.
+  Reads without it are dropped.
 * UMIs end up as `@readname_UMI` (5′ blocks, then 3′ blocks) — the form `umi_tools dedup`
   and UMICollapse expect. The read comment is dropped.
 * The untemplated RT base is kept with the footprint; reads shorter than `--min-len` are

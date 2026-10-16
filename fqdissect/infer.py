@@ -93,6 +93,8 @@ class Thresholds:
     gc_mid: float = 0.60           # a moderate-G/C position bridges into a strong-G/C run
     linker_max: int = 10           # longest template-switch / linker run peeled off the footprint
     min_anchor_frac: float = 0.15  # a short read may only expose the adapter in a minority
+    strand_min_loci: int = 200     # --gtf: footprint loci in a CDS needed to call strandedness
+    strand_frac: float = 0.80      # --gtf: share of those loci on one side for sense/antisense
 
     @classmethod
     def from_overrides(cls, pairs: list[str] | None) -> "Thresholds":
@@ -119,6 +121,8 @@ RT_MIN_PENETRANCE = 0.12
 RT_TERMINAL_PEN_LO = 0.15  # a 5'-terminal RT base (no UMI in front) sits at
                          # intermediate penetrance; below this position 0 is
                          # genomic (a footprint 5'-ligation bias), not an RT base
+RT_STEP_DROP = 0.5       # ... and the base after an RT base keeps at most this share of
+                         # its penetrance: the RT base is a step, not a ramp
 MAX_WALK = 26            # positions to walk left of the adapter
 MIN_ANCHORED_READS = 300  # an adapter this well evidenced is real even in a minority
                           # of reads (a long insert hides it from the rest)
@@ -227,7 +231,8 @@ def genomic_plateau(profile: dict) -> float | None:
 
 
 # --- the 5' side -----------------------------------------------------------
-def call_5prime(profile: dict, plateau: float, flags: list[str], thr: Thresholds) -> dict:
+def call_5prime(profile: dict, plateau: float, flags: list[str], thr: Thresholds,
+                sense: bool = True) -> dict:
     """Segment the 5' construct into UMI / barcode / non-templated additions.
 
     Model, insert-first:
@@ -244,6 +249,13 @@ def call_5prime(profile: dict, plateau: float, flags: list[str], thr: Thresholds
     UMI is balanced and uniform. Penetrance sets the frame: a UMI/barcode/linker
     is present in every read (penetrance ~1); the RT base in only a fraction
     (intermediate); the footprint never (~0).
+
+    The RT base sits at the RNA's 5' end, which is the read's 5' end only in a
+    sense library. With `sense=False` (antisense, `--gtf`) the read starts at the
+    RNA's 3' end: no RT base and no template-switch G/C run is looked for here
+    (`call_3prime` looks for them), and a
+    poly(T) start -- an antisense poly(A)-tailed library -- is refused, because a
+    variable-length run leaves no fixed footprint start to measure from.
     """
     m5 = np.asarray(profile["p5_match"], dtype=float)
     c5 = profile["p5_comp"]
@@ -253,6 +265,22 @@ def call_5prime(profile: dict, plateau: float, flags: list[str], thr: Thresholds
     con = [consensus(c5[p]) for p in range(n)]
     gc = [gc_fraction(c5[p]) for p in range(n)]
     at = [at_fraction(c5[p]) for p in range(n)]
+
+    def empty():
+        return {"umi5_len": 0, "barcode5_seq": "unknown", "p5_layout": [],
+                "rt5_len": 0, "rt5_penetrance": 0.0, "rt_nt": False,
+                "ts5_len": 0, "ts5_seq": ""}
+
+    if not sense:
+        run = 0
+        while run < n:
+            base, frac = dominant(c5[run])
+            if base != con[0] or frac < HOMOPOLYMER_FRAC:
+                break
+            run += 1
+        if run >= HOMOPOLYMER_MIN:
+            flags.append(f"antisense_5p_poly_tail:poly{con[0]}")
+            return empty()
 
     # --- footprint start: the first position that is, and stays, genomic. Some
     #     poor libraries only reach penetrance ~0.4 in the footprint, so "genomic"
@@ -267,9 +295,7 @@ def call_5prime(profile: dict, plateau: float, flags: list[str], thr: Thresholds
             break
     if f is None:
         flags.append("5p_never_reaches_genomic")
-        return {"umi5_len": 0, "barcode5_seq": "unknown", "p5_layout": [],
-                "rt5_len": 0, "rt5_penetrance": 0.0, "rt_nt": False,
-                "ts5_len": 0, "ts5_seq": ""}
+        return empty()
 
     # --- a genuine 5' construct is clipped in every read, so penetrance ~1 at
     #     the read start. A ramp starting mid-range is a heterogeneous footprint
@@ -278,6 +304,19 @@ def call_5prime(profile: dict, plateau: float, flags: list[str], thr: Thresholds
 
     b = f
     rt5_len, ts5_seq, rt_nt, pen_rt = 0, "", False, 0.0
+
+    # --- an RT base in fewer than half the reads, right behind a full-penetrance
+    #     construct. Below footprint_pen it was taken as the footprint start, so the
+    #     peel below would never see it -- and an RT base at 49 % would be reported
+    #     differently from the same base at 51 % (ELP1: one protocol, 18 libraries,
+    #     43-62 %). A position between a full-penetrance construct and a clear drop is
+    #     a construct of variable length: an added base, whatever its share.
+    if (sense and 0 < f < n - 1 and not math.isnan(m5[f + 1])
+            and pen[f - 1] >= thr.struct_pen
+            and RT_TERMINAL_PEN_LO <= pen[f] < thr.footprint_pen
+            and pen[f + 1] <= RT_STEP_DROP * pen[f]):
+        rt5_len, rt_nt, pen_rt = 1, True, float(pen[f])
+        f += 1                                  # the footprint starts behind it
 
     # --- peel the RT base. Two independent signatures, either one suffices:
     #     (1) PARTIAL PENETRANCE. A UMI is a fixed-length element, present in
@@ -291,7 +330,7 @@ def call_5prime(profile: dict, plateau: float, flags: list[str], thr: Thresholds
     #     (2) A/T BIAS. The RT-added base is mostly A (reads as T after
     #     reverse-complementing), where a UMI base is uniform -- so a biased
     #     position is an RT base even at penetrance ~1, which (1) would miss.
-    while b > 0 and (f - b) < thr.rt_max_len:
+    while sense and b > 0 and (f - b) < thr.rt_max_len:
         j = b - 1
         if pen[j] < thr.footprint_pen or math.isnan(at[j]):
             break
@@ -330,7 +369,7 @@ def call_5prime(profile: dict, plateau: float, flags: list[str], thr: Thresholds
     #     absorbed into the footprint. Peel it when it is clearly A/T-biased (RT
     #     signature) and sits at intermediate penetrance while the next base is
     #     cleanly genomic -- i.e. a fractional extra base, not a footprint edge.
-    if (f == 0 and rt5_len == 0 and n > 1 and not math.isnan(m5[1])
+    if (sense and f == 0 and rt5_len == 0 and n > 1 and not math.isnan(m5[1])
             and RT_TERMINAL_PEN_LO <= pen[0] < thr.footprint_pen
             and not math.isnan(at[0]) and at[0] >= thr.at_abs
             and pen[1] < RT_TERMINAL_PEN_LO):
@@ -344,8 +383,10 @@ def call_5prime(profile: dict, plateau: float, flags: list[str], thr: Thresholds
     #     (D-Plex, iCLIP2). Full penetrance, G/C-biased -- where a UMI is balanced.
     #     The G-run has moderate-G/C positions interspersed among strong ones, so
     #     bridge a moderate position when its footprint-side neighbour is strong.
-    while b > 0 and pen[b - 1] >= thr.struct_pen and not math.isnan(gc[b - 1]) \
-            and len(ts5_seq) < thr.linker_max:
+    #     A run is a G/C MIXTURE at each position; one fixed G or C is a barcode base
+    #     (a barcode GTCTA must not lose its G), so constant positions stop the peel.
+    while sense and b > 0 and pen[b - 1] >= thr.struct_pen and not math.isnan(gc[b - 1]) \
+            and classify(ent[b - 1], thr) != "const" and len(ts5_seq) < thr.linker_max:
         j = b - 1
         strong = gc[j] >= thr.gc_template
         bridge = gc[j] >= thr.gc_mid and len(ts5_seq) > 0 and gc[j + 1] >= thr.gc_template
@@ -358,8 +399,8 @@ def call_5prime(profile: dict, plateau: float, flags: list[str], thr: Thresholds
     # --- peel a G/C-rich non-templated run at the read start (SMARTer TSO G-run,
     #     RT-added C opposite the cap)
     s0 = 0
-    while s0 < b and pen[s0] >= thr.struct_pen and not math.isnan(gc[s0]) \
-            and gc[s0] >= thr.gc_template:
+    while sense and s0 < b and pen[s0] >= thr.struct_pen and not math.isnan(gc[s0]) \
+            and gc[s0] >= thr.gc_template and classify(ent[s0], thr) != "const":
         s0 += 1
     ts_len = len(ts5_seq) + s0
 
@@ -372,9 +413,11 @@ def call_5prime(profile: dict, plateau: float, flags: list[str], thr: Thresholds
         blocks = segment(kinds, seqs)
         rand = sum(len(s) for k, s in blocks if k == "random")
         degen = sum(len(s) for k, s in blocks if k == "degenerate")
-        if rand + degen == 1 and not ts5_seq:
+        if rand + degen == 1 and not ts5_seq and sense:
             rt5_len += 1                        # a lone non-genomic base is RT, not a UMI
             rt_nt = True
+        elif rand + degen == 1 and not ts5_seq:
+            ts_len += 1                         # ... antisense: no RT here; non-templated
         elif rand:
             umi5_len = rand + degen             # degenerate positions inside a UMI count
         elif degen:
@@ -484,7 +527,7 @@ def downstream_umi(comp, start: int, n_reads, thr: Thresholds) -> tuple[int, str
 
 
 def call_3prime(profile: dict, plateau: float, flags: list[str],
-                thr: Thresholds, annotate: bool = True) -> tuple[dict, str]:
+                thr: Thresholds, annotate: bool = True, sense: bool = True) -> tuple[dict, str]:
     thr_genomic = CHANCE + thr.genomic_frac * (plateau - CHANCE)
     # a real UMI/barcode base is clearly non-genomic (match ~ chance); a position
     # with an *intermediate* match is the footprint's own 3' edge, depressed by
@@ -503,6 +546,9 @@ def call_3prime(profile: dict, plateau: float, flags: list[str],
         # a UMI behind the adapter, and the constant block behind that (see downstream_umi)
         "umi3_downstream_len": 0,
         "adapter3_downstream_seq": "none",
+        # antisense only: the RT base, footprint-adjacent (see the peel below)
+        "rt3_len": 0,
+        "rt3_penetrance": 0.0,
     }
     kind = profile["anchor_kind"]
     if kind.startswith("homopolymer:"):
@@ -637,6 +683,38 @@ def call_3prime(profile: dict, plateau: float, flags: list[str],
 
     # segs[0] is adjacent to the adapter; reverse to insert-first order
     segs = segs[::-1]
+
+    # In an antisense library the RNA's 5' end -- and with it the RT base and a
+    # template-switch run -- is HERE, between the footprint and the adapter, not at
+    # the read start. The same two signatures as on the 5' side (call_5prime), read
+    # outward from the footprint: partial penetrance or A/T bias is the RT base (kept);
+    # then a full-penetrance G/C run is non-templated (trimmed). Anchored on the
+    # adapter, a fractional RT base shows exactly as on the 5' side: in reads without
+    # it, the footprint's last base takes its place.
+    rt3, pen_rt3, gc3 = 0, 0.0, 0
+    if not sense and segs:
+        first = adapter_start - len(segs)       # profile index of the base after the footprint
+
+        def pen(j):
+            return float(np.clip((plateau - match[j]) / max(plateau - CHANCE, 1e-6), 0, 1))
+
+        at = [at_fraction(comp[first + k]) for k in range(len(segs))]
+        while rt3 < min(thr.rt_max_len, len(segs)) and not math.isnan(at[rt3]):
+            rest = [a for a in at[rt3 + 1: rt3 + 4] if not math.isnan(a)]
+            baseline = np.median(rest) if rest else CHANCE * 2
+            partial = pen(first + rt3) < thr.rt_pen_hi
+            biased = at[rt3] - baseline >= thr.at_jump or at[rt3] >= thr.at_abs
+            if not (partial or biased):
+                break
+            pen_rt3 = max(pen_rt3, pen(first + rt3))
+            rt3 += 1
+        while rt3 + gc3 < len(segs) and gc3 < thr.linker_max:
+            j = first + rt3 + gc3
+            if pen(j) < thr.struct_pen or gc_fraction(comp[j]) < thr.gc_template \
+                    or classify(entropy(comp[j]), thr) == "const":
+                break
+            gc3 += 1
+        segs = segs[rt3 + gc3:]
     kinds = [k for k, _ in segs]
     seqs = [b for _, b in segs]
 
@@ -659,13 +737,13 @@ def call_3prime(profile: dict, plateau: float, flags: list[str],
     # same (ts_len += degen) -- e.g. a linker that opens with a 2-nt
     # 'WW' ligation-bias reducer (A/T-degenerate).
     umi3 = rand3 + degen3 if rand3 else 0
-    nt3 = degen3 if (degen3 and not rand3) else 0
+    nt3 = (degen3 if (degen3 and not rand3) else 0) + gc3
     if nt3:
         flags.append(f"3p_degenerate_nontemplated:{nt3}")
 
     # the blocks in read order (footprint -> adapter); a trimmer must walk these, not
     # the totals, because a barcode can sit on either side of the UMI
-    p3_layout: list[dict] = []
+    p3_layout: list[dict] = [{"role": "nontemplated3", "len": gc3}] if gc3 else []
     for k, sq in blocks:
         role = "barcode3" if k == "const" else ("umi3" if rand3 else "nontemplated3")
         if p3_layout and p3_layout[-1]["role"] == role and role != "barcode3":
@@ -689,6 +767,8 @@ def call_3prime(profile: dict, plateau: float, flags: list[str],
         layout3_order=",".join(order),
         p3_layout=p3_layout,
         polyA_tail=tail,
+        rt3_len=rt3,
+        rt3_penetrance=round(pen_rt3, 3),
         # where the adapter actually starts, relative to the profile's anchor
         # (a0). The de-novo seed can begin a few nt inside the adapter, so this is
         # negative when the walk extended the adapter left through fixed bases.
@@ -748,6 +828,10 @@ def functional_view(five: dict, three: dict) -> dict:
     umi3 = _as_int(three.get("umi3_len"), 0)
     nt3 = _as_int(three.get("nt3_len"), 0)
     bc3 = three.get("barcode3_seq", "none")
+    rt3 = _as_int(three.get("rt3_len"), 0)
+    if rt3:
+        segs3.append({"cat": "enzymatic", "role": "rt_untemplated", "len": rt3,
+                      "penetrance": three.get("rt3_penetrance"), "fate": "keep"})
     if three.get("polyA_tail", "none") not in ("none", ""):
         segs3.append({"cat": "enzymatic", "role": "polyA_tail", "base": three["polyA_tail"],
                       "len": "variable", "fate": "trim"})
@@ -796,10 +880,11 @@ def functional_view(five: dict, three: dict) -> dict:
     return {
         "segments_5p": segs,
         "footprint": {"category": "footprint",
-                      "keeps_enzymatic_rt_nt": five["rt5_len"]},
+                      "keeps_enzymatic_rt_nt": five["rt5_len"] + rt3},
         "segments_3p": segs3,
         "trim_5p": trim_5p,                          # nt to clip from the 5' end
         "footprint_retains_rt_nt": five["rt5_len"],  # kept, not trimmed
+        "footprint_retains_rt_nt_3p": rt3,           # ... antisense: at the 3' end
         "trim_3p_adapter": three.get("adapter3_seq", "unknown"),
         # everything between the footprint end and the adapter -- all of it comes off
         "trim_3p_construct": umi3 + nt3 + (len(bc3) if bc3 not in ("none", "", "unknown") else 0),
@@ -820,6 +905,7 @@ def _as_int(v, d: int = 0) -> int:
 # rather than guessed. A de-novo adapter or a variable-length tail is
 # informative, not ambiguous, so neither disqualifies a call.
 HARD_FLAGS = (
+    "antisense_5p_poly_tail",
     "adapter_consensus_too_short",
     "3p_tail_no_adapter",
     "5p_never_reaches_genomic",
@@ -829,8 +915,14 @@ HARD_FLAGS = (
 )
 
 
-def infer(profile: dict, thr: Thresholds | None = None, *, annotate: bool = True) -> dict:
+def infer(profile: dict, thr: Thresholds | None = None, *, annotate: bool = True,
+          antisense: bool = False) -> dict:
     """Call the read structure from one profile dict (`fqdissect.profile.profile_bam`).
+
+    `antisense`: the reads are antisense to the mRNA (`fqdissect.strand`, needs a GTF).
+    The reads are still called in their own orientation -- their 5' end is the fixed
+    one -- but what belongs to the RNA's 5' end (RT base, template switch) is looked
+    for at the read's 3' side. Without it the reads are taken to be sense.
 
     Returns the call: `status` is 'ok' or 'undetermined' (with a `reason`); an
     'ok' call also carries the `functional` block whose `trim_5p` /
@@ -897,8 +989,10 @@ def infer(profile: dict, thr: Thresholds | None = None, *, annotate: bool = True
     if conc is not None and conc > thr.single_locus_max:
         flags.append(f"dominant_5p_locus:{conc:.2f}")
 
-    five = call_5prime(profile, plateau, flags, thr)
-    three, deposit = call_3prime(profile, plateau, flags, thr, annotate)
+    five = call_5prime(profile, plateau, flags, thr, sense=not antisense)
+    three, deposit = call_3prime(profile, plateau, flags, thr, annotate, sense=not antisense)
+    if antisense:
+        out["read_orientation"] = "antisense"
 
     out.update(
         genomic_plateau=round(plateau, 3),
@@ -958,6 +1052,8 @@ def _arch_token_3p(s: dict) -> str:
         return f"[barcode,{s.get('seq', '?')}]"
     if r == "nontemplated3":
         return f"[nt,{s['len']}nt]"
+    if r == "rt_untemplated":
+        return _arch_token_5p(s)
     if r == "polyA_tail":
         return f"[{s.get('base', 'polyA')}]"
     if r == "adapter":

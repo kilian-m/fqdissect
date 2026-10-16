@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import gzip
+import re
 import shutil
 
 import pytest
 
 from conftest import CUSTOM, QIASEQ, TRUSEQ
-from fqdissect import infer, profile, structure, trim
+from fqdissect import infer, profile, strand, structure, trim
 from fqdissect.cli import main
+from fqdissect.utils import read_json
 
 THR = infer.Thresholds(min_reads=1000)
 
@@ -189,3 +191,116 @@ def test_run_from_a_bam_writes_every_output(library, tmp_path, capsys):
     assert "5'-[UMI,2nt]-[footprint" in capsys.readouterr().out
     for ext in ("structure.json", "structure.tsv", "profile.json", "structure.png"):
         assert (out / f"s.{ext}").stat().st_size > 0
+
+
+# --- strandedness (--gtf) ---------------------------------------------------------------
+# every synthetic read aligns to the + strand of chr1, between 1000 and 199000
+def _gtf(tmp_path, *rows, name="ann.gtf"):
+    path = tmp_path / name
+    path.write_text("".join(f"{c}\ttest\tCDS\t{s}\t{e}\t.\t{st}\t0\tgene_id \"g\";\n"
+                            for c, s, e, st in rows))
+    return str(path)
+
+
+@pytest.mark.parametrize("rows, want", [
+    ([("chr1", 1, 200_000, "+")], "sense"),
+    ([("chr1", 1, 200_000, "-")], "antisense"),
+    ([("chr1", 1, 100_000, "+"), ("chr1", 100_001, 200_000, "-")], "unstranded"),
+    ([("1", 1, 200_000, "+")], "sense"),          # Ensembl names on a UCSC-named genome
+])
+def test_strandedness_from_the_annotated_cds_strand(library, tmp_path, rows, want):
+    lib = library()
+    ann = strand.load_gtf(_gtf(tmp_path, *rows))
+    st = strand.call_strandedness(lib["bam"], ann, min_loci=200, strand_frac=0.8)
+    assert st["call"] == want and st["feature"] == "CDS"
+    assert st["sense_loci"] + st["antisense_loci"] > 5000
+
+
+def test_strandedness_refuses_on_too_few_loci(library, tmp_path):
+    lib = library()
+    ann = strand.load_gtf(_gtf(tmp_path, ("chr1", 1, 3000, "+")))
+    st = strand.call_strandedness(lib["bam"], ann, min_loci=200, strand_frac=0.8)
+    assert st["call"] == "undetermined" and "loci" in st["reason"]
+
+
+def test_strandedness_is_only_reported_with_a_gtf(library, tmp_path):
+    lib = library(five="NN", three="NNNNNTAGAC")
+    common = ["run", lib["fastq"], "--genome", lib["fasta"], "--bam", lib["bam"],
+              "--set", "min_reads=1000", "-p", "2"]
+    assert main(common + ["-o", str(tmp_path / "a"), "--name", "s"]) == 0
+    assert "strandedness" not in read_json(tmp_path / "a" / "s.structure.json")
+    gtf = _gtf(tmp_path, ("chr1", 1, 200_000, "-"))
+    assert main(common + ["-o", str(tmp_path / "b"), "--name", "s", "--gtf", gtf]) == 0
+    assert read_json(tmp_path / "b" / "s.structure.json")["strandedness"]["call"] == "antisense"
+    assert "# strandedness: antisense" in (tmp_path / "b" / "s.structure.tsv").read_text()
+    # a GTF for another genome fails before any work is done
+    other = _gtf(tmp_path, ("scaffold_7", 1, 1000, "+"), name="other.gtf")
+    assert main(common + ["-o", str(tmp_path / "c"), "--gtf", other]) == 2
+
+
+# --- antisense libraries: the RNA's 5' end is at the read's 3' side -------------------
+def test_antisense_rt_base_is_found_between_footprint_and_3p_umi(library):
+    lib = library(five="NNNN", three="NNNN", adapter=CUSTOM, rt3_frac=0.9)
+    prof = profile.profile_bam(lib["bam"], lib["fasta"], label="lib")
+    call = infer.infer(prof, THR, antisense=True)
+    assert call["status"] == "ok" and call["read_orientation"] == "antisense"
+    assert call["rt3_len"] == 1 and call["umi3_len"] == 4 and call["umi5_len"] == 4
+    assert call["functional"]["dedup_umi_len"] == 8
+    assert re.search(r"-\[footprint,~\d+nt\]-\[RT,\d+%\]-\[UMI,4nt\]-",
+                     structure.structure_string(call, prof))
+    # the sense rules read the same base as a fifth UMI position, and trim it
+    sense = infer.infer(prof, THR)
+    assert sense["rt3_len"] == 0 and sense["umi3_len"] == 5
+
+
+def test_antisense_rules_do_not_invent_an_rt_base(library):
+    _, call = dissect(library(five="NN", three="NNNNNTAGAC"), antisense=True)
+    assert call["status"] == "ok"
+    assert call["rt3_len"] == 0 and call["umi3_len"] == 5 and call["umi5_len"] == 2
+
+
+def test_antisense_poly_t_start_is_refused(library):
+    _, call = dissect(library(poly_t5=True), antisense=True)
+    assert call["status"] == "undetermined" and "antisense_5p_poly_tail" in call["reason"]
+
+
+def test_antisense_trimming_keeps_the_rt_base_on_the_footprint(library, tmp_path):
+    if not shutil.which("cutadapt"):
+        pytest.skip("cutadapt not installed")
+    lib = library(n=3000, five="NNNN", three="NNNN", adapter=CUSTOM, rt3_frac=0.9)
+    _, call = dissect(lib, antisense=True)
+    out = str(tmp_path / "trimmed.fastq.gz")
+    trim.trim_fastq(call, lib["fastq"], out, threads=2)
+    got = _read_fastq(out)
+    want = {f"{name}_{umi}": insert for name, insert, umi in lib["truth"]}
+    assert sum(want.get(k) == v for k, v in got.items()) / len(got) > 0.97
+
+
+# --- a 5' barcode is located, not counted ---------------------------------------------
+def test_a_5p_barcode_is_cut_by_anchored_alignment(library):
+    _, call = dissect(library(five="NNGTCTANNNNN"))
+    one, two = _commands(call)
+    # the UMI in front is cut in the same pass, the one behind it in the next
+    assert "-u 2 " in one and "-g ^GTCTA -e 2 --discard-untrimmed" in one
+    assert "-a " not in one                       # one adapter per pass
+    assert "-u 5 " in two and "-a AGATCGGAAGAG" in two
+
+
+def test_barcode_errors_scale_with_its_length():
+    assert [trim.barcode_errors("A" * n) for n in (3, 4, 5, 7, 8)] == [1, 1, 2, 2, 3]
+
+
+def test_an_indel_in_a_5p_barcode_moves_the_cut(library, tmp_path):
+    if not shutil.which("cutadapt"):
+        pytest.skip("cutadapt not installed")
+    lib = library(n=4000, five="GTCTANNNNN", five_del_frac=0.03)
+    _, call = dissect(lib)
+    assert call["status"] == "ok" and call["barcode5_seq"] == "GTCTA"
+    out = str(tmp_path / "trimmed.fastq.gz")
+    trim.trim_fastq(call, lib["fastq"], out, threads=2)
+    got = _read_fastq(out)
+    want = {f"{name}_{umi}": insert for name, insert, umi in lib["truth"]}
+    # a fixed 10-nt cut gets every read with a deletion wrong (3%). Alignment fixes
+    # most: a deleted LAST barcode base (GTCT+x) aligns as well as a substitution in
+    # it, and is read as one -- the far commoner error -- so ~1/4 of deletions remain
+    assert sum(want.get(k) == v for k, v in got.items()) / len(got) > 0.985

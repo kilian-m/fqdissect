@@ -512,7 +512,7 @@ def _trim_summary(call: dict) -> str:
     fn = call.get("functional") or {}
     if call.get("status") != "ok" or not fn:
         return ""
-    rt = fn.get("footprint_retains_rt_nt", 0)
+    rt = fn.get("footprint_retains_rt_nt", 0) + fn.get("footprint_retains_rt_nt_3p", 0)
     rt_s = f" (keep {rt}nt RT)" if rt else ""
     adap = call.get("adapter3_name")
     if adap in ("none", "unknown", None):

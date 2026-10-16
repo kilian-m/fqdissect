@@ -161,6 +161,15 @@ which is how a non-templated addition is told apart from a UMI base even when th
 two abut. **No protocol uses a 1-nt UMI**, so a lone non-genomic 5' base is an
 RT addition, not a UMI.
 
+An RT base present in *fewer than half* of the reads falls below `FOOTPRINT_PEN` and
+would be taken for the footprint start. Directly behind a full-penetrance construct,
+a position at penetrance 0.15–0.50 followed by a drop to at most half of that is
+still read as the RT base: a construct of variable length is an added base,
+whatever its share. Without this, one protocol was reported with an RT base in 13 of
+18 libraries (the ELP1 Ribo-seq set, 43–62 % at position 8) and without it in the
+other 5. The trim is the same either way -- the base is kept -- only the report changed.
+SRR24210493 shows the same base at 28 % (A/T 0.68).
+
 ## 6. Reading the 3' side (`call_3prime`)
 
 Walk **left from the adapter start** through `adap_match`, nearest-first:
@@ -212,3 +221,78 @@ cannot be segmented. The reason is written into the JSON and the figure title, a
 `fqdissect run` exits with status 3. A poly(A) library whose real adapter lies beyond
 the tail is *not* refused: the tail is reported and trimmed, the adapter is reported as
 not visible.
+
+## 9. Strandedness (`--gtf`)
+
+Whether a read is sense or antisense to its mRNA decides which end of it is the
+footprint's 5' end, and so every P-site offset downstream. The reads alone cannot
+tell: a stranded library is strand-pure at each locus whichever way round it is. The
+missing fact is which strand is transcribed, and it is taken from an annotation, so
+the call is made only with `--gtf` and is absent otherwise.
+
+`fqdissect/strand.py` takes the CDS features (exons if the GTF has none), and counts
+the alignments that overlap a CDS on exactly one strand: **sense** when the read
+aligned to the CDS's strand, **antisense** otherwise. Overlaps of CDSs on both strands
+are skipped. The unit is a distinct 5' locus, not a read, for the same reason as the
+locus cap (§4b): one abundant fragment is one molecule.
+
+| sense share of the loci | call |
+|---|---|
+| ≥ `strand_frac` (0.80) | `sense` |
+| ≤ 1 − `strand_frac` | `antisense` |
+| 0.40–0.60 | `unstranded` |
+| anything else, or < `strand_min_loci` (200) loci | `undetermined`, with a reason |
+
+Sequence names are matched across naming conventions (`1` ↔ `chr1`, `MT` ↔ `chrM`); a
+GTF sharing no name with the genome is an error before anything is aligned. On the
+seven validation runs (human, Ensembl 90 CDS) every library is sense, with 99.5–99.9 %
+of 7 000–43 000 loci.
+
+**The strand is called first, and the structure call uses it.** An antisense read is
+still called in its own orientation -- its 5' end is the fixed one (the sequencing
+primer), its 3' end is where the adapter turns up at a length-dependent position, so
+reverse-complementing the read would destroy both anchors. What moves is what belongs
+to the RNA's 5' end, because in an antisense read that end lies between the footprint
+and the adapter:
+
+| element | sense: looked for | antisense: looked for |
+|---|---|---|
+| untemplated RT base (partial or A/T-biased; kept) | 5' side, next to the footprint | 3' side, next to the footprint |
+| template-switch / G/C run (trimmed) | 5' side | 3' side, next to the footprint, as `nontemplated` |
+| poly(A) tail | 3' side | would be a variable poly(T) at the read start: refused (`antisense_5p_poly_tail`) |
+
+UMIs, barcodes and the adapter are positional and need no rule change. Without
+`--gtf`, or when the call is not `antisense`, the sense rules apply as before.
+
+Checked on antisense versions of two validation runs, built from their real reads
+(each read's molecule up to the adapter, reverse-complemented, followed by the
+reverse complement of the Illumina read-1 adapter, as a read 2 would show it;
+`work/make_antisense.py`): both are called antisense (0.4 % / 0.6 % sense), and
+
+    SRR30996711as  5'-[UMI,4nt]-[footprint,~29nt]-[RT,86%]-[UMI,4nt]-[TruSeq,…]-3'
+    SRR24210493as  5'-[barcode,GTCTA]-[UMI,5nt]-[footprint,~30nt]-[UMI,2nt]-[TruSeq,…]-3'
+
+-- the mirror images of the sense calls. The sense rules on the same reads trim 3
+of the 4 5' UMI bases and the RT base. Trimmed, the antisense reads are the reverse
+complements of the trimmed sense reads: SRR30996711as in 100.0 % of reads.
+
+SRR24210493as is the test for a **5' barcode**. The sense library carries it in front
+of the adapter, where cutadapt finds it by alignment; the antisense one at the read
+start. Cut there at a fixed length, every read with an indel in the barcode comes out
+shifted, so `--trim` locates a 5' barcode by anchored alignment instead (`-g ^GTCTA`,
+40 % of its length in errors; `fqdissect/trim.py`). Of the 898 288 reads the sense
+library keeps:
+
+| 5' barcode cut | identical to sense | wrong | dropped |
+|---|---|---|---|
+| fixed length | 857 894 | 8 367 | 32 027 |
+| anchored, 1 error | 857 731 | 173 | 40 384 |
+| anchored, 2 errors (40 % of 5 nt) | 863 512 | 313 | 34 463 |
+
+(32 k reads are missing from every row because the antisense test library was only
+built from reads whose adapter was found exactly.) One error drops reads with two
+substitutions in the barcode, which a fixed cut handles; 2 % of this library has a
+barcode with 1-2 differences from TAGAC (TAGAA, CAGAC, GGGAC, ... each <= 0.5 %, so
+not a second sample). A deletion of the barcode's last base is irreducibly ambiguous:
+`GTCT`+x aligns as well with a substitution of its last base, the commoner error,
+and is read as one.

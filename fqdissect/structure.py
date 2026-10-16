@@ -20,7 +20,7 @@ Segment kinds and what happens to them:
 """
 from __future__ import annotations
 
-from . import adapters
+from . import adapters, strand
 
 _ABSENT = ("none", "unknown", "", None, "none_visible")
 
@@ -68,6 +68,10 @@ def segments(call: dict, profile: dict | None = None) -> list[dict]:
     if hist:
         ins["min_len"], ins["max_len"] = _pct(hist, 0.01), _pct(hist, 0.99)
     segs.append(ins)
+    rt3 = int(fn.get("footprint_retains_rt_nt_3p", 0))
+    if rt3:             # antisense: the RNA's 5' end is the read's 3' side
+        segs.append({"kind": "rt", "side": 3, "len": rt3,
+                     "penetrance": call.get("rt3_penetrance")})
 
     # --- 3' construct, footprint -> adapter
     tail = call.get("polyA_tail", "none")
@@ -212,5 +216,7 @@ def to_tsv(call: dict, profile: dict | None = None) -> str:
             f"# status: {call.get('status', '')}"
             + (f" ({call['reason']})" if call.get("reason") else ""),
             f"# structure: {structure_string(call, profile)}",
+            *([f"# strandedness: {strand.describe(call['strandedness'])}"]
+              if call.get("strandedness") else []),
             "\t".join(["order", "segment", "length", "sequence", "fate", "note"])]
     return "\n".join(head + ["\t".join(r) for r in rows]) + "\n"

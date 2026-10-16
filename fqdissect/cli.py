@@ -53,6 +53,9 @@ def build_parser() -> argparse.ArgumentParser:
     ref.add_argument("--star-index", help="STAR index of that genome (required unless --bam)")
     ref.add_argument("--bam", help="skip sampling+alignment: a BAM of the UNTRIMMED reads "
                                    "aligned with fqdissect's local STAR settings")
+    ref.add_argument("--gtf", help="annotation (GTF/GFF, .gz ok) of that genome: also call "
+                                   "whether the reads are sense or antisense to the mRNA "
+                                   "(not reported without it)")
     smp = run.add_argument_group("sampling")
     smp.add_argument("-n", "--sample", type=int, default=200_000, help="reads to sample")
     smp.add_argument("--scan", type=int, default=1_000_000,
@@ -116,7 +119,7 @@ def _trim(args, call: dict, fastq: str, out_fq: str) -> dict | None:
 
 
 def cmd_run(args) -> int:
-    from . import align, infer, profile, sample, structure
+    from . import align, infer, profile, sample, strand, structure
 
     if not args.bam and not args.star_index:
         raise ValueError("give --star-index (or a pre-aligned --bam)")
@@ -126,6 +129,14 @@ def cmd_run(args) -> int:
     name = args.name or sample_name(args.fastq)
     os.makedirs(args.outdir, exist_ok=True)
     base = os.path.join(args.outdir, name)
+    ann = None
+    if args.gtf:        # load and check it before the slow part, not after
+        import pysam
+        ann = strand.load_gtf(args.gtf)
+        with pysam.FastaFile(args.genome) as fa:
+            if not ann.match_references(fa.references):
+                raise ValueError(f"--gtf {args.gtf}: none of its sequence names is in "
+                                 f"the genome {args.genome}")
 
     tmp = tempfile.mkdtemp(prefix=f"{name}.tmp.", dir=args.outdir)
     try:
@@ -137,6 +148,10 @@ def cmd_run(args) -> int:
                                            seed=args.seed, threads=args.threads)
             bam = align.align_local(fq, args.star_index, os.path.join(tmp, "star"),
                                     threads=args.threads, genome_load=args.star_genome_load)
+        # strandedness first: it decides at which end of the read the structure call
+        # looks for what belongs to the RNA's 5' end
+        stranded = strand.call_strandedness(bam, ann, min_loci=thr.strand_min_loci,
+                                            strand_frac=thr.strand_frac) if ann else None
         prof = profile.profile_bam(bam, args.genome, label=name,
                                    min_anchor_frac=thr.min_anchor_frac)
     finally:
@@ -144,12 +159,15 @@ def cmd_run(args) -> int:
             shutil.rmtree(tmp, ignore_errors=True)
     prof["sampling"] = sampling
 
-    call = infer.infer(prof, thr, annotate=not args.no_annotate)
+    antisense = bool(stranded) and stranded["call"] == "antisense"
+    call = infer.infer(prof, thr, annotate=not args.no_annotate, antisense=antisense)
     call["fqdissect_version"] = __version__
     call["library_type"] = args.library_type
     call["fastq"] = os.path.abspath(args.fastq)
     call["structure"] = structure.structure_string(call, prof)
     call["segments"] = structure.segments(call, prof)
+    if stranded:
+        call["strandedness"] = stranded
     if call["segments"]:
         call["adapter_scaffold"] = structure.scaffold(call)
     write_json(base + ".profile.json", prof)
@@ -167,6 +185,8 @@ def cmd_run(args) -> int:
     write_json(base + ".structure.json", call)
 
     LOG.info("wrote %s", base + ".structure.json")
+    if stranded:
+        LOG.info("strandedness: %s", strand.describe(stranded))
     for flag in call.get("flags") or []:
         LOG.info("flag: %s", flag)
     print(f"{name}\t{call['status']}\t{call['structure']}")
