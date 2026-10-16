@@ -296,3 +296,9 @@ barcode with 1-2 differences from TAGAC (TAGAA, CAGAC, GGGAC, ... each <= 0.5 %,
 not a second sample). A deletion of the barcode's last base is irreducibly ambiguous:
 `GTCT`+x aligns as well with a substitution of its last base, the commoner error,
 and is read as one.
+
+**Output orientation.** `--trim` reverse-complements an antisense library after the
+last cutadapt pass (`fqdissect/revcomp.py`; pigz then compresses), so the footprints
+come out sense, as Ribo-seq tools expect; `--keep-orientation` skips it. The trimmed
+SRR30996711as reads are then identical to the trimmed sense reads, sequence and
+qualities, in 100 % of reads.

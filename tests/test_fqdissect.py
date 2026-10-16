@@ -7,7 +7,7 @@ import shutil
 import pytest
 
 from conftest import CUSTOM, QIASEQ, TRUSEQ
-from fqdissect import infer, profile, strand, structure, trim
+from fqdissect import infer, profile, revcomp, strand, structure, trim
 from fqdissect.cli import main
 from fqdissect.utils import read_json
 
@@ -264,16 +264,48 @@ def test_antisense_poly_t_start_is_refused(library):
     assert call["status"] == "undetermined" and "antisense_5p_poly_tail" in call["reason"]
 
 
-def test_antisense_trimming_keeps_the_rt_base_on_the_footprint(library, tmp_path):
-    if not shutil.which("cutadapt"):
-        pytest.skip("cutadapt not installed")
+@pytest.mark.parametrize("keep", [False, True])
+def test_antisense_trimming_writes_sense_footprints(library, tmp_path, keep):
+    if not (shutil.which("cutadapt") and shutil.which("pigz")):
+        pytest.skip("cutadapt or pigz not installed")
     lib = library(n=3000, five="NNNN", three="NNNN", adapter=CUSTOM, rt3_frac=0.9)
     _, call = dissect(lib, antisense=True)
     out = str(tmp_path / "trimmed.fastq.gz")
-    trim.trim_fastq(call, lib["fastq"], out, threads=2)
+    stats = trim.trim_fastq(call, lib["fastq"], out, threads=2, keep_orientation=keep)
+    assert stats["reverse_complemented"] is not keep and stats["n_reads_out"] > 2900
     got = _read_fastq(out)
-    want = {f"{name}_{umi}": insert for name, insert, umi in lib["truth"]}
+    # the RT base stays on the footprint; reverse-complemented, it is back at its 5' end
+    orient = (lambda x: x) if keep else profile.revcomp
+    want = {f"{name}_{umi}": orient(insert) for name, insert, umi in lib["truth"]}
     assert sum(want.get(k) == v for k, v in got.items()) / len(got) > 0.97
+
+
+def test_only_antisense_libraries_are_reverse_complemented(library):
+    _, sense = dissect(library(five="NN", three="NNNNNTAGAC"))
+    assert not any("fqdissect.revcomp" in c for c in _commands(sense))
+    _, anti = dissect(library(five="NN", three="NNNNNTAGAC"), antisense=True)
+    stages, _ = trim.build_pipeline(anti, "in.fq.gz", "out.fq.gz", threads=3)
+    assert stages[-3]["cmd"][-3:-1] == ["-o", "-"]          # [..., -o, -, input]
+    assert stages[-2]["cmd"][-2:] == ["-m", "fqdissect.revcomp"]
+    assert stages[-1]["cmd"] == ["pigz", "-p", "3", "-1", "-c"]
+    assert stages[-1]["stdout"] == "out.fq.gz"
+    assert trim.shell_script(stages).rstrip().endswith("> out.fq.gz")
+
+
+@pytest.mark.parametrize("chunk", [7, 64, 1 << 20])
+def test_revcomp_handles_any_chunk_boundary(chunk):
+    import io
+    fq = b"".join(b"@r%d x\nACGTNacgtR%s\n+\nABCDEFGHIJ%s\n" % (i, b"A" * i, b"I" * i)
+                  for i in range(50))
+    out = io.BytesIO()
+    assert revcomp.revcomp_fastq(io.BytesIO(fq), out, chunk=chunk) == 50
+    recs = out.getvalue().split(b"\n")
+    assert recs[1] == b"YacgtNACGT" and recs[3] == b"JIHGFEDCBA" and recs[0] == b"@r0 x"
+    assert recs[5] == b"TYacgtNACGT"
+    # a missing final newline is fine, a missing line is not
+    assert revcomp.revcomp_fastq(io.BytesIO(fq.rstrip(b"\n")), io.BytesIO(), chunk) == 50
+    with pytest.raises(ValueError):
+        revcomp.revcomp_fastq(io.BytesIO(fq + b"@x\nACGT\n"), io.BytesIO(), chunk)
 
 
 # --- a 5' barcode is located, not counted ---------------------------------------------

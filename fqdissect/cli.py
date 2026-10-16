@@ -27,6 +27,9 @@ def _add_trim_options(ap: argparse.ArgumentParser) -> None:
     g.add_argument("--keep-untrimmed", action="store_true",
                    help="keep reads that do not show the 3' adapter (default: drop them; "
                         "their 3' end is the read's end, not the footprint's)")
+    g.add_argument("--keep-orientation", action="store_true",
+                   help="write an antisense library as sequenced (default: reverse-"
+                        "complement it, so the footprints are sense to the mRNA)")
     g.add_argument("--dry-run", action="store_true",
                    help="write the trimming script but do not run it")
     g.add_argument("--force", action="store_true",
@@ -110,7 +113,8 @@ def _trim(args, call: dict, fastq: str, out_fq: str) -> dict | None:
                     "plan)", call.get("status"))
         return None
     kw = dict(min_len=args.min_len, threads=args.threads, min_overlap=args.min_overlap,
-              discard_untrimmed=not args.keep_untrimmed)
+              discard_untrimmed=not args.keep_untrimmed,
+              keep_orientation=args.keep_orientation)
     if args.dry_run:
         stages, _ = trim.build_pipeline(call, fastq, out_fq, **kw)
         sys.stdout.write(trim.shell_script(stages))

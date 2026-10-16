@@ -145,6 +145,10 @@ adapter (a 3′ UMI, a UMI behind the adapter): cutadapt cuts fixed lengths *bef
 looks for the adapter, so the 3′ cut has to wait for the pass after. The passes are
 piped; nothing intermediate is written.
 
+* An **antisense** library (needs `--gtf`) is reverse-complemented after trimming, so
+  the footprints come out sense to the mRNA, the RT base back at their 5' end
+  (`--keep-orientation` writes them as sequenced). The UMIs in the read names stay as
+  extracted.
 * A 5' barcode is located by anchored alignment (`-g ^BARCODE`, 40 % of its length in
   errors), not cut at a fixed length, so an indel in it does not shift the footprint.
   Reads without it are dropped.
